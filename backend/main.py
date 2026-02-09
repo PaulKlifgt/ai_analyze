@@ -1,7 +1,8 @@
 import shutil
 import os
 import re
-from typing import List, Optional, Dict
+import tempfile
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -61,28 +62,66 @@ class AnalysisResponse(BaseModel):
     graph_edges: List[GraphEdge]
 
 # --- Утилиты ---
+
 def clean(text: str) -> str:
+    """
+    Агрессивная очистка: заменяет любые переносы строк и табуляции на один пробел.
+    Это критично для склеивания разорванных заголовков.
+    """
     if not text: return ""
+    # Заменяем \xa0 (неразрывный пробел) и \n на обычный пробел
+    text = text.replace('\xa0', ' ').replace('\n', ' ')
+    # Схлопываем множественные пробелы в один
     return re.sub(r'\s+', ' ', text).strip()
 
 def split_section_name_content(raw_text: str) -> tuple[str, str]:
     """
-    Разделяет 'Раздел 1. Введение. Тут идет описание...' на Заголовок и Описание.
+    Разделяет текст на Заголовок и Содержание.
+    Приоритет: Заголовок — это первое полноценное предложение.
     """
     txt = clean(raw_text)
     
-    # 1. Поиск первой точки после 10-го символа (чтобы не отрезать "Раздел 1.")
-    # Обычно заголовок короткий (до 100 символов), а описание длинное
-    dot_idx = txt.find('.', 8)
+    # 1. Если текст пустой
+    if not txt: return "", ""
+
+    # 2. Ищем префикс (Раздел Х / Тема Х)
+    prefix = ""
+    match_prefix = re.match(r"^(Раздел \d+\.?|Тема \d+\.?)\s*", txt)
+    if match_prefix:
+        prefix = match_prefix.group(0)
+        # Работаем с текстом ПОСЛЕ префикса
+        body = txt[len(prefix):].strip()
+    else:
+        body = txt
+
+    # 3. Ищем границу предложения.
+    # Граница — это точка (.), за которой следует пробел и Заглавная буква (или конец строки).
+    # Регулярка: (\.)(\s+)([А-ЯA-Z])
     
-    if dot_idx != -1 and dot_idx < 100:
-        # Проверяем, что после точки идет пробел и Большая буква (начало предложения)
-        if dot_idx + 2 < len(txt) and txt[dot_idx+1] == ' ':
-             name = txt[:dot_idx+1]
-             content = txt[dot_idx+1:].strip()
-             return name, content
+    split_match = re.search(r"(\.)(\s+)([А-ЯA-Z])", body)
     
-    return txt, "" # Не удалось разделить
+    if split_match:
+        # Нашли точку, разделяющую предложения
+        dot_idx = split_match.start()
+        # Заголовок = Префикс + Текст до точки включительно
+        title_part = body[:dot_idx+1] 
+        # Контент = Всё что после
+        content_part = body[dot_idx+1:].strip()
+        
+        full_title = (prefix + " " + title_part).strip()
+        # Убираем двойные точки если есть
+        full_title = full_title.replace("..", ".")
+        
+        return full_title, content_part
+
+    # 4. Если явного разделения предложения нет (нет точки в середине)
+    # Если текст не гигантский (например, < 250 символов), считаем ВЕСЬ текст заголовком.
+    # Это исправляет ошибку, когда заголовок длинный, но без точки в конце.
+    if len(txt) < 300:
+        return txt, ""
+
+    # 5. Фолбэк: Если текст огромный и без точек, отрезаем первые 100 символов как заголовок
+    return txt[:100] + "...", txt[100:]
 
 # --- DOCX Парсер ---
 def parse_docx_structural(file_path: str) -> DisciplineData:
@@ -93,18 +132,16 @@ def parse_docx_structural(file_path: str) -> DisciplineData:
     # 1. Название
     for p in doc.paragraphs[:20]:
         t = clean(p.text)
-        if "«" in t and "»" in t and len(t) < 150:
+        if "«" in t and "»" in t and len(t) < 200:
             if "УНИВЕРСИТЕТ" not in t.upper() and "СОГЛАСОВАНА" not in t.upper():
                 data.name = t.strip('«»"\n')
                 break
 
-    # 2. Цели (Гибридный поиск)
-    # Сначала пробуем Regex по всему тексту (надежнее)
+    # 2. Цели
     goals_match = re.search(r"(1\.3|Цели)\.?\s*Цели.*?\n(.*?)(2\.|Содержание)", full_text_blob, re.DOTALL | re.I)
     if goals_match:
         data.goals = clean(goals_match.group(2))
     else:
-        # Если не вышло, пробуем параграфы
         goals_acc = []
         in_goals = False
         for p in doc.paragraphs:
@@ -133,88 +170,80 @@ def parse_docx_structural(file_path: str) -> DisciplineData:
             elif state == 'lit_add' and re.match(r"^\d+\.", t):
                 data.literature.additional.append(t)
 
-    # 4. ТАБЛИЦЫ (Поиск данных, а не заголовков)
+    # 4. ТАБЛИЦЫ
     for table in doc.tables:
         if len(table.rows) < 2: continue
         
-        # Склеиваем шапку для идентификации
-        header_raw = " ".join([c.text.lower() for row in table.rows[:5] for c in row.cells])
+        hours_indices = []
+        # Ищем колонки с цифрами
+        for r in table.rows[1:8]:
+            for i, cell in enumerate(r.cells):
+                txt = cell.text.strip()
+                if txt.isdigit() and len(txt) <= 3:
+                    if i not in hours_indices: hours_indices.append(i)
         
-        # А) ПАСПОРТ
-        if "объем" in header_raw or "паспорт" in header_raw:
-            for row in table.rows:
-                rt = " ".join([c.text.lower() for c in row.cells])
-                if "период" in rt: 
-                    for c in reversed(row.cells): 
-                        if c.text.strip(): data.period = clean(c.text); break
-                if "объем" in rt: 
-                    for c in reversed(row.cells):
-                        if c.text.strip(): data.volume = clean(c.text); break
-
-        # Б) PO
-        if "результат" in header_raw:
-            for row in table.rows:
-                for cell in row.cells:
-                    txt = clean(cell.text)
-                    if re.match(r"^(PO|УК|ОПК|ПК)[- ]?\d+", txt, re.I):
-                        if txt not in data.outcomes: data.outcomes.append(txt)
-
-        # В) РАЗДЕЛЫ (Детектор структуры данных)
-        # Мы считаем таблицу "таблицей разделов", если:
-        # 1. Колонок >= 4
-        # 2. В колонках 2, 3 или 4 есть цифры в большинстве строк
+        hours_indices.sort()
         
-        if len(table.columns) >= 4:
-            # Проверка на цифры
-            digit_col_found = False
-            hours_indices = []
-            
-            # Сканируем строки данных (со 2-й по 10-ю)
-            for r in table.rows[1:10]:
-                for i in range(2, len(r.cells)):
-                    if r.cells[i].text.strip().isdigit():
-                        if i not in hours_indices: hours_indices.append(i)
-            
-            hours_indices.sort()
-            
-            # Если нашли колонки с цифрами - это наша таблица!
-            if len(hours_indices) >= 2: # Хотя бы Лекции и Практика
+        if len(hours_indices) >= 2: 
+            for row in table.rows:
+                cells = row.cells
+                if not cells: continue
                 
-                # Парсим
-                for row in table.rows:
-                    cells = row.cells
-                    c0 = clean(cells[0].text)
-                    
-                    # Фильтр мусора
-                    if "итого" in c0.lower() or "раздел" in c0.lower() or "промежуточная" in c0.lower(): continue
-                    
-                    # Пытаемся взять Имя и Контент
-                    # Вариант 1: Имя в Col 0, Контент в Col 1
-                    name_cand = c0
-                    content_cand = clean(cells[1].text) if len(cells) > 1 else ""
-                    
-                    final_name = name_cand
-                    final_content = content_cand
+                c0 = clean(cells[0].text)
+                
+                if "итого" in c0.lower() or "раздел" in c0.lower() or "семестр" in c0.lower(): continue
+                if len(c0) < 2: continue
 
-                    # Вариант 2: Если Col 1 пустая, возможно всё в Col 0 (нужно разделить)
-                    if not content_cand and len(name_cand) > 10:
-                        n, c = split_section_name_content(name_cand)
-                        final_name = n
-                        final_content = c
+                final_name = ""
+                final_content = ""
+
+                # Логика определения колонок
+                first_hour_col = hours_indices[0]
+                
+                # Если до первой цифры есть 2+ колонки (0 и 1), значит: 0=Название/Номер, 1=Содержание/Название
+                if first_hour_col >= 2 and len(cells) > 1:
+                    c1 = clean(cells[1].text)
+                    if c1:
+                        # Если c0 очень короткое (просто номер "1."), а c1 длинное -> c1 это название
+                        if len(c0) < 6 and len(c1) > 5:
+                            n, c = split_section_name_content(c1)
+                            final_name = f"Тема {c0} {n}"
+                            final_content = c
+                        else:
+                            # Иначе считаем c0 названием, c1 контентом
+                            final_name = c0
+                            final_content = c1
+                    else:
+                        # c1 пустая, берем всё из c0
+                        final_name, final_content = split_section_name_content(c0)
+                else:
+                    # Мало колонок, всё в c0
+                    final_name, final_content = split_section_name_content(c0)
+
+                # Доп. проверка: если имя получилось слишком коротким ("Основные"), а контент начинается с маленькой буквы
+                # значит мы ошибочно разделили.
+                if len(final_name.split()) < 3 and len(final_name) < 30 and final_content and final_content[0].islower():
+                     final_name = f"{final_name} {final_content}"
+                     final_content = ""
+
+                # Часы
+                h = HoursDetail()
+                try:
+                    vals = []
+                    for idx in hours_indices:
+                        if idx < len(cells):
+                            v = clean(cells[idx].text)
+                            vals.append(v if v.isdigit() else "0")
                     
-                    if len(final_name) < 2 and len(final_content) < 5: continue
+                    if len(vals) >= 1: h.lectures = vals[0]
+                    if len(vals) >= 2: h.practice = vals[1]
+                    if len(vals) == 3: h.self_study = vals[2]
+                    elif len(vals) >= 4:
+                         h.labs = vals[2]
+                         h.self_study = vals[3]
+                except: pass
 
-                    # Часы
-                    h = HoursDetail()
-                    try:
-                        if len(hours_indices) >= 1: h.lectures = clean(cells[hours_indices[0]].text)
-                        if len(hours_indices) >= 2: h.practice = clean(cells[hours_indices[1]].text)
-                        if len(hours_indices) >= 3: h.labs = clean(cells[hours_indices[2]].text)
-                        # СР обычно последняя
-                        h.self_study = clean(cells[hours_indices[-1]].text)
-                    except: pass
-
-                    data.sections.append(SectionDetail(name=final_name, content=final_content, hours=h))
+                data.sections.append(SectionDetail(name=final_name, content=final_content, hours=h))
 
     return data
 
@@ -227,8 +256,8 @@ def parse_pdf_regex(file_path: str) -> DisciplineData:
         for page in reader.pages: text += page.extract_text() + "\n"
     except: return data
 
-    m = re.search(r"ДИСЦИПЛИНЫ\s*«([^»]+)»", text, re.I)
-    if m: data.name = clean(m.group(1))
+    m = re.search(r"ДИСЦИПЛИНЫ\s*«([^»]+)»", clean(text), re.I)
+    if m: data.name = m.group(1)
     
     vol = re.search(r"(\d+\s*з\.е\.)", text)
     if vol: data.volume = clean(vol.group(1))
@@ -236,14 +265,12 @@ def parse_pdf_regex(file_path: str) -> DisciplineData:
     goals = re.search(r"Цели дисциплины.*?\n(.*?)(2\.|Содержание)", text, re.DOTALL | re.I)
     if goals: data.goals = clean(goals.group(1))
 
-    # Разделы (PDF)
-    # Разбиваем по ключевому слову "Раздел"
+    # Разделы (PDF) - Улучшенный regex
     chunks = re.split(r"(Раздел \d+\.)", text)
     for i in range(1, len(chunks), 2):
-        header = chunks[i] # Раздел 1.
-        body = chunks[i+1] # Текст...
+        header = chunks[i] 
+        body = chunks[i+1]
         
-        # Ищем часы в body (группа цифр)
         hours_m = re.search(r"(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})", body)
         h = HoursDetail()
         
@@ -251,18 +278,14 @@ def parse_pdf_regex(file_path: str) -> DisciplineData:
         if hours_m:
             nums = hours_m.groups()
             h.lectures, h.practice, h.labs, h.self_study = nums
-            # Удаляем строку с цифрами из контента
             content = body.replace(hours_m.group(0), "")
         
-        # Пытаемся вытащить название (первая строка)
-        lines = content.strip().split('\n')
-        name_part = lines[0] if lines else "Тема"
-        content_part = "\n".join(lines[1:]) if len(lines) > 1 else ""
+        # Используем ту же функцию clean и split для PDF
+        name, desc = split_section_name_content(content)
         
-        full_name = f"{header} {name_part}"
-        data.sections.append(SectionDetail(name=full_name, content=content_part[:500], hours=h))
+        full_name = f"{header} {name}"
+        data.sections.append(SectionDetail(name=full_name, content=desc[:500], hours=h))
 
-    # ПО
     soft = re.search(r"Перечень программного.*?\n(.*?)(6\.|Особенности)", text, re.DOTALL | re.I)
     if soft:
         for l in soft.group(1).split('\n'):
@@ -281,8 +304,10 @@ def build_graph(data: DisciplineData) -> tuple[List[GraphNode], List[GraphEdge]]
     for i, s in enumerate(data.sections):
         sid = f"s_{i}"
         lbl = s.name.replace("Раздел", "").strip()
+        lbl = re.sub(r"^\d+\.\s*", "", lbl) # Убираем номер
         if len(lbl) > 25: lbl = lbl[:25] + "..."
         if len(lbl) < 2: lbl = f"Раздел {i+1}"
+        
         nodes.append(GraphNode(id=sid, label=lbl, type="section", data={"full_name": s.name, "content": s.content, "hours": s.hours}))
         edges.append(GraphEdge(source=root, target=sid))
 
@@ -301,17 +326,24 @@ def build_graph(data: DisciplineData) -> tuple[List[GraphNode], List[GraphEdge]]
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze(file: UploadFile = File(...)):
-    path = f"temp_{file.filename}"
-    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
-    
+    # Используем tempfile для надежности
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext == ".docx": data = parse_docx_structural(path)
-    elif ext == ".pdf": data = parse_pdf_regex(path)
-    else: 
-        os.remove(path)
-        raise HTTPException(400, "Only PDF/DOCX")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        if ext == ".docx": data = parse_docx_structural(tmp_path)
+        elif ext == ".pdf": data = parse_pdf_regex(tmp_path)
+        else: 
+            raise HTTPException(400, "Only PDF/DOCX")
+    except Exception as e:
+        print(e)
+        raise HTTPException(500, "Parsing Error")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         
-    os.remove(path)
     nodes, edges = build_graph(data)
     return AnalysisResponse(metadata=data, graph_nodes=nodes, graph_edges=edges)
 

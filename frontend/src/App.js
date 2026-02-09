@@ -10,20 +10,6 @@ const Card = ({ title, children }) => (
   </div>
 );
 
-// Карта для перевода технических ключей в человеческие
-const KEY_MAP = {
-  full_name: "Полное название",
-  content: "Содержание",
-  hours: "Часы (нагрузка)",
-  lectures: "Лекции",
-  practice: "Практика",
-  labs: "Лабораторные",
-  self_study: "Сам. работа",
-  period: "Период",
-  volume: "Объем",
-  goals: "Цели"
-};
-
 const App = () => {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
@@ -50,12 +36,12 @@ const App = () => {
       
       const layoutNodes = graph_nodes.map((n, i) => {
         let x=0, y=0, bg='#fff', w=180;
-        if (n.type === 'discipline') { x=400; y=0; bg='#dbeafe'; w=280; }
+        if (n.type === 'discipline') { x=400; y=0; bg='#dbeafe'; w=300; }
         else if (n.type === 'outcome') { x=50; y=100+i*120; bg='#fef3c7'; }
-        else if (n.type === 'tool') { x=800; y=100+i*80; bg='#dcfce7'; }
+        else if (n.type === 'tool') { x=850; y=100+i*80; bg='#dcfce7'; }
         else if (n.type === 'section') { 
             const row = Math.floor(i/3); const col = i%3;
-            x = 250 + col*240; y = 500 + row*180; bg='#f3f4f6';
+            x = 300 + col*250; y = 500 + row*200; bg='#f3f4f6'; w=220;
         }
         return { 
             id: n.id, position: {x,y}, data: {label: n.label, ...n.data}, 
@@ -87,76 +73,56 @@ const App = () => {
       <div className="w-1/3 min-w-[400px] p-4 overflow-y-auto bg-white shadow-xl z-20">
         {!metadata ? <div className="text-center mt-20 text-gray-400">Выберите файл</div> : (
             selectedNode ? (
-                <Card title="Подробная информация">
-                    {/* Заголовок */}
-                    <div className="font-bold text-lg mb-4 text-slate-800 leading-snug">
-                        {selectedNode.data.full_name || selectedNode.data.label}
-                    </div>
-
-                    {/* Часы (если есть) */}
+                <Card title="Детали элемента">
+                    <div className="font-bold mb-3 text-lg leading-snug">{selectedNode.data.full_name || selectedNode.data.label}</div>
+                    
                     {selectedNode.data.hours && (
                         <div className="mb-4">
-                            <div className="text-xs font-bold text-gray-500 uppercase mb-1">Нагрузка (часы)</div>
+                            <div className="text-[10px] uppercase text-gray-500 font-bold mb-1">Нагрузка</div>
                             <div className="grid grid-cols-4 gap-2 text-center text-xs">
-                                <div className="bg-blue-50 p-2 rounded border border-blue-100">
+                                <div className="bg-blue-50 p-2 border border-blue-100 rounded">
                                     <div className="font-bold text-blue-700 text-lg">{selectedNode.data.hours.lectures}</div>
                                     Лекции
                                 </div>
-                                <div className="bg-green-50 p-2 rounded border border-green-100">
+                                <div className="bg-green-50 p-2 border border-green-100 rounded">
                                     <div className="font-bold text-green-700 text-lg">{selectedNode.data.hours.practice}</div>
                                     Практика
                                 </div>
-                                <div className="bg-purple-50 p-2 rounded border border-purple-100">
+                                <div className="bg-purple-50 p-2 border border-purple-100 rounded">
                                     <div className="font-bold text-purple-700 text-lg">{selectedNode.data.hours.labs}</div>
                                     Лаб.
                                 </div>
-                                <div className="bg-orange-50 p-2 rounded border border-orange-100">
+                                <div className="bg-orange-50 p-2 border border-orange-100 rounded">
                                     <div className="font-bold text-orange-700 text-lg">{selectedNode.data.hours.self_study}</div>
                                     Сам.раб
                                 </div>
                             </div>
                         </div>
                     )}
-
-                    {/* Контент и прочие поля */}
-                    {Object.entries(selectedNode.data).map(([key, val]) => {
-                        if (['label', 'full_name', 'hours'].includes(key)) return null;
-                        if (!val || val === '-' || val === '0') return null;
-                        
-                        return (
-                            <div key={key} className="mb-4">
-                                <div className="text-xs font-bold text-gray-500 uppercase mb-1">
-                                    {KEY_MAP[key] || key}
-                                </div>
-                                <div className="text-sm text-gray-700 whitespace-pre-wrap bg-gray-50 p-2 rounded border">
-                                    {val}
-                                </div>
-                            </div>
-                        );
-                    })}
                     
-                    <button onClick={()=>setSelectedNode(null)} className="w-full mt-2 py-2 bg-blue-100 text-blue-800 font-medium rounded hover:bg-blue-200 transition">
-                        Закрыть
-                    </button>
+                    {selectedNode.data.content && (
+                        <div className="mt-3">
+                            <div className="text-[10px] uppercase text-gray-500 font-bold mb-1">Содержание</div>
+                            <div className="bg-gray-50 p-3 rounded border text-xs leading-relaxed text-gray-700 whitespace-pre-wrap">
+                                {selectedNode.data.content}
+                            </div>
+                        </div>
+                    )}
+                    
+                    <button onClick={()=>setSelectedNode(null)} className="w-full mt-4 py-2 bg-slate-100 hover:bg-slate-200 rounded text-slate-700 text-sm font-medium transition">Закрыть</button>
                 </Card>
             ) : (
                 <>
                     <Card title="Паспорт дисциплины">
                         <div className="font-bold text-lg mb-2">{metadata.name}</div>
-                        <div className="grid grid-cols-2 gap-2 text-xs">
-                            <div className="bg-slate-100 p-2 rounded">
-                                <span className="block text-gray-500">Объем</span>
-                                <span className="font-bold">{metadata.volume}</span>
-                            </div>
-                            <div className="bg-slate-100 p-2 rounded">
-                                <span className="block text-gray-500">Период</span>
-                                <span className="font-bold">{metadata.period}</span>
-                            </div>
+                        <div className="flex gap-2 text-xs">
+                            <span className="bg-blue-100 text-blue-800 px-2 py-1 rounded font-mono">Объем: {metadata.volume}</span>
+                            <span className="bg-blue-100 text-blue-800 px-2 py-1 rounded font-mono">Период: {metadata.period}</span>
                         </div>
                     </Card>
                     
                     <Card title="Цели освоения">
-                        <p className="text-sm whitespace-pre-wrap leading-relaxed">{metadata.goals}</p>
+                        <p className="text-sm whitespace-pre-wrap leading-relaxed">{metadata.goals || "Не найдено"}</p>
                     </Card>
 
                     <Card title="Программное обеспечение">
@@ -167,10 +133,13 @@ const App = () => {
 
                     <Card title="Разделы курса">
                         {metadata.sections.map((s,i) => (
-                            <div key={i} className="mb-3 border-l-4 border-slate-300 pl-3 py-1">
-                                <div className="font-bold text-sm text-blue-900">{s.name}</div>
-                                <div className="text-xs text-gray-500 mt-1 font-mono">
-                                    Лек:{s.hours.lectures} | Пр:{s.hours.practice} | Лаб:{s.hours.labs}
+                            <div key={i} className="mb-4 border-l-4 border-slate-300 pl-3 py-1 hover:bg-slate-50 transition">
+                                <div className="font-bold text-sm text-blue-900 mb-1">{s.name}</div>
+                                {s.content && <div className="text-xs text-gray-600 mb-2 line-clamp-3" title={s.content}>{s.content}</div>}
+                                <div className="flex gap-3 text-[10px] text-gray-500 font-mono bg-white inline-block px-2 py-1 rounded border">
+                                    <span>Лек:{s.hours.lectures}</span>
+                                    <span>Пр:{s.hours.practice}</span>
+                                    <span>Лаб:{s.hours.labs}</span>
                                 </div>
                             </div>
                         ))}
@@ -179,15 +148,15 @@ const App = () => {
                     <Card title="Литература">
                         {metadata.literature.main.length > 0 && (
                             <div className="mb-3">
-                                <div className="text-xs font-bold text-gray-400 uppercase mb-1">Основная</div>
+                                <div className="text-[10px] font-bold text-gray-400 uppercase mb-1">Основная</div>
                                 <ul className="list-decimal pl-4 text-xs space-y-1">
-                                    {metadata.literature.main.map((l,i)=><li key={i}>{l}</li>)}
+                                    {metadata.literature.main.map((l,i)=><li key={i} className="break-words">{l}</li>)}
                                 </ul>
                             </div>
                         )}
                         {metadata.literature.additional.length > 0 && (
                             <div>
-                                <div className="text-xs font-bold text-gray-400 uppercase mb-1">Дополнительная</div>
+                                <div className="text-[10px] font-bold text-gray-400 uppercase mb-1">Дополнительная</div>
                                 <ul className="list-decimal pl-4 text-xs space-y-1">
                                     {metadata.literature.additional.map((l,i)=><li key={i}>{l}</li>)}
                                 </ul>
