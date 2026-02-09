@@ -1,21 +1,28 @@
 import React, { useState, useCallback } from 'react';
-import ReactFlow, { 
-  Controls, 
-  Background, 
-  applyEdgeChanges, 
-  applyNodeChanges, 
-  MiniMap 
-} from 'reactflow';
+import ReactFlow, { Controls, Background, applyEdgeChanges, applyNodeChanges, MiniMap } from 'reactflow';
 import 'reactflow/dist/style.css';
 import axios from 'axios';
 
-// UI Компоненты
-const Card = ({ title, children, className }) => (
-  <div className={`bg-white p-4 rounded shadow mb-4 border border-gray-200 ${className}`}>
-    <h3 className="font-bold text-lg mb-2 border-b pb-1 text-blue-800">{title}</h3>
+const Card = ({ title, children }) => (
+  <div className="bg-white p-4 rounded-lg shadow-sm border border-gray-200 mb-4">
+    <h3 className="font-bold text-blue-900 border-b pb-2 mb-3 text-sm uppercase tracking-wide">{title}</h3>
     <div className="text-sm text-gray-700">{children}</div>
   </div>
 );
+
+// Карта для перевода технических ключей в человеческие
+const KEY_MAP = {
+  full_name: "Полное название",
+  content: "Содержание",
+  hours: "Часы (нагрузка)",
+  lectures: "Лекции",
+  practice: "Практика",
+  labs: "Лабораторные",
+  self_study: "Сам. работа",
+  period: "Период",
+  volume: "Объем",
+  goals: "Цели"
+};
 
 const App = () => {
   const [nodes, setNodes] = useState([]);
@@ -26,183 +33,170 @@ const App = () => {
 
   const onNodesChange = useCallback((changes) => setNodes((nds) => applyNodeChanges(changes, nds)), []);
   const onEdgesChange = useCallback((changes) => setEdges((eds) => applyEdgeChanges(changes, eds)), []);
-  
-  const onNodeClick = (event, node) => {
-    setSelectedNode(node);
-  };
+  const onNodeClick = (e, node) => setSelectedNode(node);
 
-  const handleFileUpload = async (e) => {
+  const handleFile = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-
     setLoading(true);
-    setMetadata(null);
-    setNodes([]);
-    setEdges([]);
-    setSelectedNode(null);
-
+    
     const formData = new FormData();
     formData.append('file', file);
 
     try {
       const res = await axios.post('http://localhost:8000/api/analyze', formData);
-      const data = res.data;
-
-      setMetadata(data.metadata);
-
-      const layoutNodes = data.graph_nodes.map((node, i) => {
-        let pos = { x: 0, y: 0 };
-        const style = { width: 150, fontSize: '12px', textAlign: 'center' };
-
-        if (node.type === 'discipline') {
-          pos = { x: 400, y: 50 };
-          style.background = '#dbeafe'; 
-          style.width = 250;
-          style.fontWeight = 'bold';
-          style.fontSize = '14px';
-        } else if (node.type === 'outcome') {
-          pos = { x: 100, y: 150 + i * 120 };
-          style.background = '#fef3c7';
-        } else if (node.type === 'tool') {
-          pos = { x: 750, y: 150 + i * 80 };
-          style.background = '#d1fae5';
-        } else if (node.type === 'section') {
-          const col = i % 3;
-          const row = Math.floor(i / 3);
-          pos = { x: 250 + col * 200, y: 500 + row * 150 };
-          style.background = '#f3f4f6';
-          style.width = 180;
+      const { metadata, graph_nodes, graph_edges } = res.data;
+      setMetadata(metadata);
+      
+      const layoutNodes = graph_nodes.map((n, i) => {
+        let x=0, y=0, bg='#fff', w=180;
+        if (n.type === 'discipline') { x=400; y=0; bg='#dbeafe'; w=280; }
+        else if (n.type === 'outcome') { x=50; y=100+i*120; bg='#fef3c7'; }
+        else if (n.type === 'tool') { x=800; y=100+i*80; bg='#dcfce7'; }
+        else if (n.type === 'section') { 
+            const row = Math.floor(i/3); const col = i%3;
+            x = 250 + col*240; y = 500 + row*180; bg='#f3f4f6';
         }
-
-        return {
-          id: node.id,
-          type: 'default',
-          data: { label: node.label, ...node.data },
-          position: pos,
-          style: { ...style, border: '1px solid #777', borderRadius: '8px', padding: '10px' }
+        return { 
+            id: n.id, position: {x,y}, data: {label: n.label, ...n.data}, 
+            style: {background: bg, border:'1px solid #999', borderRadius:8, padding:10, width:w, fontSize:12, textAlign:'center'} 
         };
       });
-
-      const layoutEdges = data.graph_edges.map((edge, i) => ({
-        id: `e-${i}`,
-        source: edge.source,
-        target: edge.target,
-        label: edge.label,
-        animated: true,
-        style: { stroke: '#b1b1b7' }
-      }));
-
       setNodes(layoutNodes);
-      setEdges(layoutEdges);
-
-    } catch (err) {
-      console.error(err);
-      alert("Ошибка обработки файла. Проверьте консоль Python.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Функция для безопасного отображения данных узла (чтобы не падал React)
-  const renderValue = (key, value) => {
-    if (key === 'label') return null;
-    
-    // Если это объект (например, часы), рендерим красиво
-    if (typeof value === 'object' && value !== null) {
-      return (
-        <div key={key} className="mb-2">
-          <span className="font-semibold text-gray-600 block">{key}:</span>
-          <div className="pl-2 text-xs bg-white rounded border border-gray-200">
-            {Object.entries(value).map(([k, v]) => (
-              <div key={k} className="flex justify-between px-1">
-                <span>{k}:</span> <span>{v}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      );
-    }
-    // Обычный текст
-    return (
-      <div key={key} className="mb-1 break-words">
-        <span className="font-semibold text-gray-600">{key}:</span> {value}
-      </div>
-    );
+      setEdges(graph_edges.map((e,i)=>({...e, id:`e${i}`, animated:true, style:{stroke:'#ccc'}})));
+    } catch (e) { console.error(e); alert("Ошибка при обработке"); }
+    finally { setLoading(false); }
   };
 
   return (
-    <div className="flex flex-col h-screen bg-gray-50 font-sans">
-      <header className="bg-slate-800 text-white p-4 shadow-md flex justify-between items-center z-10">
-        <h1 className="text-xl font-bold">🎓 ИИ-Анализатор РПД</h1>
-        <div className="flex items-center gap-4">
-           {loading && <span className="text-yellow-300 animate-pulse font-bold">Анализ...</span>}
-           <label className="cursor-pointer bg-blue-600 hover:bg-blue-500 text-white py-2 px-4 rounded transition">
-             Загрузить файл
-             <input type="file" onChange={handleFileUpload} className="hidden" accept=".doc,.docx,.pdf" />
-           </label>
+    <div className="flex h-screen bg-slate-50 font-sans">
+      <div className="flex-1 relative border-r">
+        <ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onNodeClick={onNodeClick} fitView>
+          <Background gap={20} color="#e5e7eb" />
+          <Controls />
+          <MiniMap style={{height: 100}} />
+        </ReactFlow>
+        <div className="absolute top-4 left-4 z-10">
+            <label className="bg-blue-600 text-white px-4 py-2 rounded cursor-pointer shadow hover:bg-blue-700 transition font-medium">
+                {loading ? "Анализ..." : "Загрузить РПД"}
+                <input type="file" onChange={handleFile} className="hidden" accept=".docx,.pdf" />
+            </label>
         </div>
-      </header>
+      </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1 border-r border-gray-300 relative bg-white">
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onNodeClick={onNodeClick}
-            fitView
-          >
-            <Background color="#ccc" gap={20} />
-            <Controls />
-            <MiniMap style={{height: 100}} />
-          </ReactFlow>
-          <div className="absolute top-4 left-4 bg-white/90 p-2 text-xs rounded shadow text-gray-600">
-            Кликните на узел для деталей
-          </div>
-        </div>
-
-        <div className="w-96 p-4 overflow-y-auto bg-gray-50 shadow-inner">
-          {!metadata ? (
-            <div className="text-gray-400 text-center mt-20">Загрузите файл для начала работы</div>
-          ) : (
-            <>
-              {selectedNode ? (
-                 <Card title="Информация об узле">
-                    <div className="font-bold text-lg mb-2">{selectedNode.data.label}</div>
-                    <div className="bg-gray-100 p-2 rounded text-xs overflow-auto max-h-[60vh]">
-                      {Object.entries(selectedNode.data).map(([key, val]) => renderValue(key, val))}
+      <div className="w-1/3 min-w-[400px] p-4 overflow-y-auto bg-white shadow-xl z-20">
+        {!metadata ? <div className="text-center mt-20 text-gray-400">Выберите файл</div> : (
+            selectedNode ? (
+                <Card title="Подробная информация">
+                    {/* Заголовок */}
+                    <div className="font-bold text-lg mb-4 text-slate-800 leading-snug">
+                        {selectedNode.data.full_name || selectedNode.data.label}
                     </div>
-                    <button onClick={() => setSelectedNode(null)} className="mt-4 w-full py-1 bg-blue-100 hover:bg-blue-200 rounded text-sm text-blue-800 transition">
-                      Закрыть
-                    </button>
-                 </Card>
-              ) : (
-                <>
-                  <Card title="📘 Паспорт">
-                    <p><strong>Название:</strong> {metadata.name}</p>
-                    <p><strong>Объем:</strong> {metadata.volume}</p>
-                  </Card>
-                  
-                  <Card title="💻 ПО">
-                    <ul className="list-disc pl-4 text-xs">
-                        {metadata.software.map((s,i) => <li key={i}>{s}</li>)}
-                    </ul>
-                  </Card>
 
-                  <Card title="📚 Разделы">
-                     {metadata.sections.map((sec, i) => (
-                       <div key={i} className="mb-2 pl-2 border-l-2 border-slate-400">
-                         <div className="font-bold text-xs">{sec.name}</div>
-                         <div className="text-[10px] text-gray-500">Лек: {sec.hours.lectures} | Прак: {sec.hours.practice}</div>
-                       </div>
-                     ))}
-                  </Card>
+                    {/* Часы (если есть) */}
+                    {selectedNode.data.hours && (
+                        <div className="mb-4">
+                            <div className="text-xs font-bold text-gray-500 uppercase mb-1">Нагрузка (часы)</div>
+                            <div className="grid grid-cols-4 gap-2 text-center text-xs">
+                                <div className="bg-blue-50 p-2 rounded border border-blue-100">
+                                    <div className="font-bold text-blue-700 text-lg">{selectedNode.data.hours.lectures}</div>
+                                    Лекции
+                                </div>
+                                <div className="bg-green-50 p-2 rounded border border-green-100">
+                                    <div className="font-bold text-green-700 text-lg">{selectedNode.data.hours.practice}</div>
+                                    Практика
+                                </div>
+                                <div className="bg-purple-50 p-2 rounded border border-purple-100">
+                                    <div className="font-bold text-purple-700 text-lg">{selectedNode.data.hours.labs}</div>
+                                    Лаб.
+                                </div>
+                                <div className="bg-orange-50 p-2 rounded border border-orange-100">
+                                    <div className="font-bold text-orange-700 text-lg">{selectedNode.data.hours.self_study}</div>
+                                    Сам.раб
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Контент и прочие поля */}
+                    {Object.entries(selectedNode.data).map(([key, val]) => {
+                        if (['label', 'full_name', 'hours'].includes(key)) return null;
+                        if (!val || val === '-' || val === '0') return null;
+                        
+                        return (
+                            <div key={key} className="mb-4">
+                                <div className="text-xs font-bold text-gray-500 uppercase mb-1">
+                                    {KEY_MAP[key] || key}
+                                </div>
+                                <div className="text-sm text-gray-700 whitespace-pre-wrap bg-gray-50 p-2 rounded border">
+                                    {val}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    
+                    <button onClick={()=>setSelectedNode(null)} className="w-full mt-2 py-2 bg-blue-100 text-blue-800 font-medium rounded hover:bg-blue-200 transition">
+                        Закрыть
+                    </button>
+                </Card>
+            ) : (
+                <>
+                    <Card title="Паспорт дисциплины">
+                        <div className="font-bold text-lg mb-2">{metadata.name}</div>
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                            <div className="bg-slate-100 p-2 rounded">
+                                <span className="block text-gray-500">Объем</span>
+                                <span className="font-bold">{metadata.volume}</span>
+                            </div>
+                            <div className="bg-slate-100 p-2 rounded">
+                                <span className="block text-gray-500">Период</span>
+                                <span className="font-bold">{metadata.period}</span>
+                            </div>
+                        </div>
+                    </Card>
+                    
+                    <Card title="Цели освоения">
+                        <p className="text-sm whitespace-pre-wrap leading-relaxed">{metadata.goals}</p>
+                    </Card>
+
+                    <Card title="Программное обеспечение">
+                        <ul className="list-disc pl-4 text-sm space-y-2">
+                            {metadata.software.map((s,i)=><li key={i} className="break-words">{s}</li>)}
+                        </ul>
+                    </Card>
+
+                    <Card title="Разделы курса">
+                        {metadata.sections.map((s,i) => (
+                            <div key={i} className="mb-3 border-l-4 border-slate-300 pl-3 py-1">
+                                <div className="font-bold text-sm text-blue-900">{s.name}</div>
+                                <div className="text-xs text-gray-500 mt-1 font-mono">
+                                    Лек:{s.hours.lectures} | Пр:{s.hours.practice} | Лаб:{s.hours.labs}
+                                </div>
+                            </div>
+                        ))}
+                    </Card>
+
+                    <Card title="Литература">
+                        {metadata.literature.main.length > 0 && (
+                            <div className="mb-3">
+                                <div className="text-xs font-bold text-gray-400 uppercase mb-1">Основная</div>
+                                <ul className="list-decimal pl-4 text-xs space-y-1">
+                                    {metadata.literature.main.map((l,i)=><li key={i}>{l}</li>)}
+                                </ul>
+                            </div>
+                        )}
+                        {metadata.literature.additional.length > 0 && (
+                            <div>
+                                <div className="text-xs font-bold text-gray-400 uppercase mb-1">Дополнительная</div>
+                                <ul className="list-decimal pl-4 text-xs space-y-1">
+                                    {metadata.literature.additional.map((l,i)=><li key={i}>{l}</li>)}
+                                </ul>
+                            </div>
+                        )}
+                    </Card>
                 </>
-              )}
-            </>
-          )}
-        </div>
+            )
+        )}
       </div>
     </div>
   );

@@ -6,10 +6,9 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import docx
-from docx.document import Document as _Document
 import pypdf
 
-app = FastAPI(title="Sirius RPD Analyzer V3")
+app = FastAPI(title="Sirius RPD Final Fix")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,9 +35,9 @@ class LiteratureList(BaseModel):
     additional: List[str]
 
 class DisciplineData(BaseModel):
-    name: str = "Не определено"
-    period: str = "Не найден"
-    volume: str = "Не найден"
+    name: str = "Без названия"
+    period: str = "-"
+    volume: str = "-"
     goals: str = ""
     sections: List[SectionDetail] = []
     outcomes: List[str] = []
@@ -61,186 +60,256 @@ class AnalysisResponse(BaseModel):
     graph_nodes: List[GraphNode]
     graph_edges: List[GraphEdge]
 
+# --- Утилиты ---
 def clean(text: str) -> str:
-    return re.sub(r'\s+', ' ', text).strip() if text else ""
+    if not text: return ""
+    return re.sub(r'\s+', ' ', text).strip()
 
-# --- DOCX Logic (С сохранением рабочей логики для таблиц) ---
+def split_section_name_content(raw_text: str) -> tuple[str, str]:
+    """
+    Разделяет 'Раздел 1. Введение. Тут идет описание...' на Заголовок и Описание.
+    """
+    txt = clean(raw_text)
+    
+    # 1. Поиск первой точки после 10-го символа (чтобы не отрезать "Раздел 1.")
+    # Обычно заголовок короткий (до 100 символов), а описание длинное
+    dot_idx = txt.find('.', 8)
+    
+    if dot_idx != -1 and dot_idx < 100:
+        # Проверяем, что после точки идет пробел и Большая буква (начало предложения)
+        if dot_idx + 2 < len(txt) and txt[dot_idx+1] == ' ':
+             name = txt[:dot_idx+1]
+             content = txt[dot_idx+1:].strip()
+             return name, content
+    
+    return txt, "" # Не удалось разделить
 
-def parse_docx_robust(file_path: str) -> DisciplineData:
+# --- DOCX Парсер ---
+def parse_docx_structural(file_path: str) -> DisciplineData:
     doc = docx.Document(file_path)
     data = DisciplineData()
-    
-    # 1. Текстовый анализ (Цели, ПО, Название)
-    full_text = "\n".join([p.text for p in doc.paragraphs])
-    
-    nm = re.search(r"ДИСЦИПЛИНЫ\s*«([^»]+)»", full_text, re.I)
-    if nm: data.name = nm.group(1)
-    
-    soft = re.search(r"Перечень программного.*?\n(.*?)(6\.|Особенности)", full_text, re.DOTALL | re.I)
-    if soft:
-        for line in soft.group(1).split('\n'):
-            line = clean(line)
-            if len(line) > 3 and not "http" in line and not "Не требуется" in line:
-                data.software.append(re.sub(r"^\d+\.\s*", "", line))
+    full_text_blob = "\n".join([p.text for p in doc.paragraphs])
 
-    # 2. Табличный анализ (Разделы, Часы, Паспорт)
+    # 1. Название
+    for p in doc.paragraphs[:20]:
+        t = clean(p.text)
+        if "«" in t and "»" in t and len(t) < 150:
+            if "УНИВЕРСИТЕТ" not in t.upper() and "СОГЛАСОВАНА" not in t.upper():
+                data.name = t.strip('«»"\n')
+                break
+
+    # 2. Цели (Гибридный поиск)
+    # Сначала пробуем Regex по всему тексту (надежнее)
+    goals_match = re.search(r"(1\.3|Цели)\.?\s*Цели.*?\n(.*?)(2\.|Содержание)", full_text_blob, re.DOTALL | re.I)
+    if goals_match:
+        data.goals = clean(goals_match.group(2))
+    else:
+        # Если не вышло, пробуем параграфы
+        goals_acc = []
+        in_goals = False
+        for p in doc.paragraphs:
+            t = clean(p.text)
+            if re.match(r"^1\.3|^Цели дисциплины", t, re.I):
+                in_goals = True
+                continue
+            if in_goals:
+                if re.match(r"^2\.|^Содержание", t, re.I): break
+                goals_acc.append(t)
+        if goals_acc: data.goals = " ".join(goals_acc)
+
+    # 3. Списки
+    state = None
+    for p in doc.paragraphs:
+        t = clean(p.text)
+        if re.match(r"^4\.1", t): state = 'lit_main'
+        elif re.match(r"^4\.2", t): state = 'lit_add'
+        elif re.match(r"^5\.2", t): state = 'soft'
+        elif re.match(r"^(6\.|5\.3|3\.|2\.)", t): state = None
+        else:
+            if state == 'soft' and (re.match(r"^(\d+\.|-|•)", t) or len(t)>3):
+                if "Перечень" not in t: data.software.append(re.sub(r"^\d+\.\s*", "", t))
+            elif state == 'lit_main' and re.match(r"^\d+\.", t):
+                data.literature.main.append(t)
+            elif state == 'lit_add' and re.match(r"^\d+\.", t):
+                data.literature.additional.append(t)
+
+    # 4. ТАБЛИЦЫ (Поиск данных, а не заголовков)
     for table in doc.tables:
-        rows_text = [" ".join([c.text.lower() for c in r.cells]) for r in table.rows]
-        header = " ".join(rows_text[:5])
+        if len(table.rows) < 2: continue
         
-        # Паспорт
-        if "объем" in header:
+        # Склеиваем шапку для идентификации
+        header_raw = " ".join([c.text.lower() for row in table.rows[:5] for c in row.cells])
+        
+        # А) ПАСПОРТ
+        if "объем" in header_raw or "паспорт" in header_raw:
             for row in table.rows:
                 rt = " ".join([c.text.lower() for c in row.cells])
-                if "объем" in rt: data.volume = clean(row.cells[-1].text)
-                if "период" in rt: data.period = clean(row.cells[-1].text)
+                if "период" in rt: 
+                    for c in reversed(row.cells): 
+                        if c.text.strip(): data.period = clean(c.text); break
+                if "объем" in rt: 
+                    for c in reversed(row.cells):
+                        if c.text.strip(): data.volume = clean(c.text); break
 
-        # Разделы (Ищем таблицу с "Раздел" и цифрами)
-        if "раздел" in header and len(table.columns) >= 3:
-            # Пытаемся найти колонки
-            lec_idx = -1
-            for i, cell in enumerate(table.rows[0].cells): # Или row[1]
-                if "л" in cell.text.lower() or "лек" in cell.text.lower(): lec_idx = i
+        # Б) PO
+        if "результат" in header_raw:
+            for row in table.rows:
+                for cell in row.cells:
+                    txt = clean(cell.text)
+                    if re.match(r"^(PO|УК|ОПК|ПК)[- ]?\d+", txt, re.I):
+                        if txt not in data.outcomes: data.outcomes.append(txt)
+
+        # В) РАЗДЕЛЫ (Детектор структуры данных)
+        # Мы считаем таблицу "таблицей разделов", если:
+        # 1. Колонок >= 4
+        # 2. В колонках 2, 3 или 4 есть цифры в большинстве строк
+        
+        if len(table.columns) >= 4:
+            # Проверка на цифры
+            digit_col_found = False
+            hours_indices = []
             
-            # Если не нашли в первой строке, ищем во второй
-            if lec_idx == -1 and len(table.rows) > 1:
-                 for i, cell in enumerate(table.rows[1].cells):
-                    if cell.text.lower().strip() == "л": lec_idx = i
+            # Сканируем строки данных (со 2-й по 10-ю)
+            for r in table.rows[1:10]:
+                for i in range(2, len(r.cells)):
+                    if r.cells[i].text.strip().isdigit():
+                        if i not in hours_indices: hours_indices.append(i)
+            
+            hours_indices.sort()
+            
+            # Если нашли колонки с цифрами - это наша таблица!
+            if len(hours_indices) >= 2: # Хотя бы Лекции и Практика
+                
+                # Парсим
+                for row in table.rows:
+                    cells = row.cells
+                    c0 = clean(cells[0].text)
+                    
+                    # Фильтр мусора
+                    if "итого" in c0.lower() or "раздел" in c0.lower() or "промежуточная" in c0.lower(): continue
+                    
+                    # Пытаемся взять Имя и Контент
+                    # Вариант 1: Имя в Col 0, Контент в Col 1
+                    name_cand = c0
+                    content_cand = clean(cells[1].text) if len(cells) > 1 else ""
+                    
+                    final_name = name_cand
+                    final_content = content_cand
 
-            start_row = 1
-            if lec_idx != -1: start_row = 2
+                    # Вариант 2: Если Col 1 пустая, возможно всё в Col 0 (нужно разделить)
+                    if not content_cand and len(name_cand) > 10:
+                        n, c = split_section_name_content(name_cand)
+                        final_name = n
+                        final_content = c
+                    
+                    if len(final_name) < 2 and len(final_content) < 5: continue
 
-            for row in table.rows[start_row:]:
-                cells = row.cells
-                if len(cells) < 3: continue
-                # Пропускаем "Итого"
-                if "итого" in cells[0].text.lower(): continue
-
-                name = clean(cells[0].text)
-                if len(name) > 3 and ("Раздел" in name or "Тема" in name or name[0].isupper()):
+                    # Часы
                     h = HoursDetail()
-                    # Если нашли индекс лекций, берем оттуда, иначе эвристика (3-я колонка)
-                    idx = lec_idx if lec_idx != -1 else 2 
-                    if idx < len(cells): h.lectures = clean(cells[idx].text)
-                    if idx+1 < len(cells): h.practice = clean(cells[idx+1].text)
-                    
-                    # Контент (обычно 2-я колонка)
-                    content = clean(cells[1].text) if len(cells) > 1 else ""
-                    
-                    data.sections.append(SectionDetail(name=name, content=content, hours=h))
+                    try:
+                        if len(hours_indices) >= 1: h.lectures = clean(cells[hours_indices[0]].text)
+                        if len(hours_indices) >= 2: h.practice = clean(cells[hours_indices[1]].text)
+                        if len(hours_indices) >= 3: h.labs = clean(cells[hours_indices[2]].text)
+                        # СР обычно последняя
+                        h.self_study = clean(cells[hours_indices[-1]].text)
+                    except: pass
 
-        # PO
-        if "результат" in header and "код" in header:
-            for row in table.rows[1:]:
-                txt = clean(row.cells[0].text) # Код обычно первый
-                if re.match(r"^(PO|УК|ПК)", txt):
-                    data.outcomes.append(txt)
+                    data.sections.append(SectionDetail(name=final_name, content=final_content, hours=h))
 
     return data
 
-# --- PDF Logic (Regex Based) ---
-
+# --- PDF Fallback ---
 def parse_pdf_regex(file_path: str) -> DisciplineData:
     data = DisciplineData()
     text = ""
     try:
         reader = pypdf.PdfReader(file_path)
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-    except Exception as e:
-        data.goals = f"Ошибка чтения PDF: {e}"
-        return data
+        for page in reader.pages: text += page.extract_text() + "\n"
+    except: return data
 
-    # 1. Название
-    nm = re.search(r"ДИСЦИПЛИНЫ\s*\n\s*«([^»]+)»", text, re.I)
-    if nm: data.name = clean(nm.group(1))
-
-    # 2. Объем (ищем "X з.е.")
+    m = re.search(r"ДИСЦИПЛИНЫ\s*«([^»]+)»", text, re.I)
+    if m: data.name = clean(m.group(1))
+    
     vol = re.search(r"(\d+\s*з\.е\.)", text)
-    if vol: data.volume = vol.group(1)
+    if vol: data.volume = clean(vol.group(1))
+    
+    goals = re.search(r"Цели дисциплины.*?\n(.*?)(2\.|Содержание)", text, re.DOTALL | re.I)
+    if goals: data.goals = clean(goals.group(1))
 
-    # 3. Разделы (Самое сложное в PDF)
-    # Ищем паттерн: "Раздел X. Название ... цифра цифра"
-    # Это ненадежно, но лучше чем ничего.
-    # Ищем строки, начинающиеся с "Раздел"
-    
-    section_pattern = re.compile(r"(Раздел \d+\..*?)\n", re.IGNORECASE)
-    matches = section_pattern.findall(text)
-    
-    for m in matches:
-        # Пытаемся найти часы в этой же строке или следующей (в PDF таблицы превращаются в текст с пробелами)
-        # Пример: "Раздел 1. Введение 2 2 0 0"
-        line = clean(m)
+    # Разделы (PDF)
+    # Разбиваем по ключевому слову "Раздел"
+    chunks = re.split(r"(Раздел \d+\.)", text)
+    for i in range(1, len(chunks), 2):
+        header = chunks[i] # Раздел 1.
+        body = chunks[i+1] # Текст...
         
-        # Ищем цифры в конце строки (часы)
-        hours_match = re.findall(r"\s(\d{1,2})\s", line)
+        # Ищем часы в body (группа цифр)
+        hours_m = re.search(r"(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})", body)
         h = HoursDetail()
-        if len(hours_match) >= 1: h.lectures = hours_match[0]
-        if len(hours_match) >= 2: h.practice = hours_match[1]
         
-        data.sections.append(SectionDetail(
-            name=line.split("  ")[0], # Берем текст до больших пробелов
-            content="Содержание в PDF сложно структурировать",
-            hours=h
-        ))
+        content = body
+        if hours_m:
+            nums = hours_m.groups()
+            h.lectures, h.practice, h.labs, h.self_study = nums
+            # Удаляем строку с цифрами из контента
+            content = body.replace(hours_m.group(0), "")
+        
+        # Пытаемся вытащить название (первая строка)
+        lines = content.strip().split('\n')
+        name_part = lines[0] if lines else "Тема"
+        content_part = "\n".join(lines[1:]) if len(lines) > 1 else ""
+        
+        full_name = f"{header} {name_part}"
+        data.sections.append(SectionDetail(name=full_name, content=content_part[:500], hours=h))
 
-    # 4. ПО
+    # ПО
     soft = re.search(r"Перечень программного.*?\n(.*?)(6\.|Особенности)", text, re.DOTALL | re.I)
     if soft:
-        lines = soft.group(1).split('\n')
-        for l in lines:
+        for l in soft.group(1).split('\n'):
             if re.match(r"^\d+\.", l.strip()):
                 data.software.append(clean(re.sub(r"^\d+\.", "", l)))
-
-    # 5. PO
-    outcomes = re.findall(r"(PO\s?\d+|УК-\d+)", text)
-    data.outcomes = list(set(outcomes)) # Уник
-
     return data
 
-
 # --- Graph ---
-
 def build_graph(data: DisciplineData) -> tuple[List[GraphNode], List[GraphEdge]]:
     nodes = []
     edges = []
     root = "root"
     
-    nodes.append(GraphNode(id=root, label=data.name[:50], type="discipline", data={"vol": data.volume}))
+    nodes.append(GraphNode(id=root, label=data.name[:60], type="discipline", data=data.dict()))
 
     for i, s in enumerate(data.sections):
-        sid = f"sec_{i}"
-        lbl = s.name[:20] + "..." if len(s.name) > 20 else s.name
-        nodes.append(GraphNode(id=sid, label=lbl, type="section", data={"h": s.hours, "content": s.content}))
-        edges.append(GraphEdge(source=root, target=sid, label="сод."))
+        sid = f"s_{i}"
+        lbl = s.name.replace("Раздел", "").strip()
+        if len(lbl) > 25: lbl = lbl[:25] + "..."
+        if len(lbl) < 2: lbl = f"Раздел {i+1}"
+        nodes.append(GraphNode(id=sid, label=lbl, type="section", data={"full_name": s.name, "content": s.content, "hours": s.hours}))
+        edges.append(GraphEdge(source=root, target=sid))
 
     for i, sw in enumerate(data.software):
         swid = f"sw_{i}"
-        nodes.append(GraphNode(id=swid, label=sw[:15], type="tool", data={"full": sw}))
-        edges.append(GraphEdge(source=root, target=swid, label="ПО"))
-    
+        lbl = sw.split(",")[0][:20]
+        nodes.append(GraphNode(id=swid, label=lbl, type="tool", data={"full_name": sw}))
+        edges.append(GraphEdge(source=root, target=swid))
+
     for i, o in enumerate(data.outcomes):
-        oid = f"out_{i}"
-        nodes.append(GraphNode(id=oid, label=o, type="outcome", data={"full": o}))
-        edges.append(GraphEdge(source=root, target=oid, label="PO"))
+        oid = f"o_{i}"
+        nodes.append(GraphNode(id=oid, label=o.split()[0], type="outcome", data={"full_name": o}))
+        edges.append(GraphEdge(source=root, target=oid))
 
     return nodes, edges
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze(file: UploadFile = File(...)):
     path = f"temp_{file.filename}"
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    with open(path, "wb") as f: shutil.copyfileobj(file.file, f)
     
     ext = os.path.splitext(file.filename)[1].lower()
-    
-    if ext == ".docx":
-        data = parse_docx_robust(path)
-    elif ext == ".pdf":
-        data = parse_pdf_regex(path)
-    else:
+    if ext == ".docx": data = parse_docx_structural(path)
+    elif ext == ".pdf": data = parse_pdf_regex(path)
+    else: 
         os.remove(path)
-        raise HTTPException(400, "Unsupported")
+        raise HTTPException(400, "Only PDF/DOCX")
         
     os.remove(path)
     nodes, edges = build_graph(data)
